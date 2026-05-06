@@ -100,15 +100,41 @@ The expression tree the parser receives differs by closure-init shape:
 
 Under `<Nullable>enable</Nullable>`, the C# compiler inserts the additional `Convert(closureField, String[])` wrapper for method-typed initialisations. `UnwrapConversions` strips the outer `op_Implicit` (it handles `MethodCallExpression` whose `Method.Name == "op_Implicit"`) but does not peel through `UnaryExpression(ExpressionType.Convert)` nodes. The Convert node remains; the receiver fails to reduce to a constant; parsing falls through to `ValueCollectionMember.ParseWhereForContains` (`src/Marten/Linq/Members/ValueCollections/ValueCollectionMember.cs:97`), which calls `LinqInternalExtensions.ReduceToConstant → FastExpressionCompiler.CompileFast` (`src/Marten/Linq/Parsing/LinqInternalExtensions.cs:340`) on **the entire Where lambda**. The compiled delegate references the lambda parameter (`s` here) from a scope where it isn't defined — the IL is malformed and `VariableBinder` rejects it.
 
-## Suggested fix
+## Where the fix could land
 
-Two reasonable shapes:
+The expression-tree shape opens up three candidate fix sites, each addressing a different layer of the problem. They're not mutually exclusive — a maintainer might land any one, or combine a targeted root-cause fix with defense-in-depth.
 
-**Option A (minimal)**: extend `UnwrapConversions` (in `LinqInternalExtensions.cs`) to peel `UnaryExpression` `ExpressionType.Convert` and `ExpressionType.ConvertChecked` nodes in addition to the existing `op_Implicit` `MethodCallExpression` handling. The compiler-inserted `Convert(string[], String[])` is structurally a no-op; standard practice in expression-tree consumers is to peel through it.
+### Option 1 — peel `Convert` in `UnwrapConversions`
 
-**Option B (robust)**: replace the pattern-match-then-reduce path in `MemoryExtensionsContains.Parse` with eager `Expression.Lambda<Func<T[]>>(receiverExpression).CompileFast()()`. Immune to whatever shape the C# compiler emits; only material cost is the compile-and-invoke per query parse, which the Marten parser cache amortises. The semantics of `Contains` only need the resolved values for the `IN (...)` SQL clause, so eager evaluation is correct.
+`src/Marten/Linq/Parsing/LinqInternalExtensions.cs`
 
-The fall-through in `ValueCollectionMember.ParseWhereForContains` is also defensible to harden — it should reject a receiver that references the predicate's parameter rather than produce malformed IL — but that's defense-in-depth on top of either fix.
+Narrowest scope. `UnwrapConversions` already strips `op_Implicit` `MethodCallExpression`s; extending it to also peel `UnaryExpression(ExpressionType.Convert | ExpressionType.ConvertChecked)` covers the compiler-inserted `string[] → string[]` no-op observed here, and any structurally similar Convert in adjacent shapes.
+
+**Tradeoff**: peel rules accumulate. The C# compiler keeps introducing new emission shapes — `<Nullable>enable</Nullable>`, span overloads, primary constructors — and each one that escapes the existing peel rules turns into a fresh user-facing crash. A liberal peel covers the immediate bug; the parser stays sensitive to whatever emission the compiler invents next.
+
+**Prior art**: peeling compiler-inserted Convert nodes is a common pattern in providers that translate LINQ to SQL — EF Core handles it throughout its expression-extension helpers.
+
+### Option 2 — eager-evaluate the receiver in `MemoryExtensionsContains.Parse`
+
+`src/Marten/Linq/Parsing/Methods/MemoryExtensionsContains.cs`
+
+`Contains` semantics only need the resolved values for the `IN (...)` SQL clause — there's no semantic benefit to the structural pattern-match-then-reduce path. Replacing the receiver reduction with `Expression.Lambda<Func<T[]>>(receiverExpression).CompileFast()()` sidesteps the compiler-emission shape entirely: whatever wrapper nodes show up, the lambda compiler resolves them to the same array.
+
+**Tradeoff**: cost is one compile-and-invoke per *unique* receiver-expression at parse time, not per query execution. Loses any structural introspection — relevant only if anything downstream of `UnwrapConversions` cares about the receiver's expression shape beyond `ReduceToConstant`'s output. If it's all "give me the values", the eager path is sufficient.
+
+### Option 3 — harden the `ParseWhereForContains` fall-through
+
+`src/Marten/Linq/Members/ValueCollections/ValueCollectionMember.cs:97`
+
+When `ReduceToConstant` is called on a receiver that doesn't reduce, the current code compiles *the entire Where lambda* as a `Func<bool>`. The receiver references the predicate's lambda parameter (`s` in this repro), so the resulting delegate references a variable from outside its own scope, and `VariableBinder` rejects the IL. That's what produces the `"variable 's' … referenced from scope ''"` message — confusing because it surfaces deep inside `FastExpressionCompiler` rather than at the LINQ-parser level.
+
+Defense-in-depth, not a root-cause fix: detecting "the receiver references the predicate parameter" before invoking the compiler would convert the malformed-IL crash into a clear `NotSupportedException`-style message. Even if Options 1 or 2 close the door, this fall-through is a sharp edge — the next emission shape that escapes the peel rules will land here, and a clearer error makes the next round of triage shorter.
+
+### Decision axes
+
+- Does anything downstream of `UnwrapConversions` rely on the structural form of the receiver, or only on `ReduceToConstant`'s output? If only the value matters, Option 2 is the lowest-future-maintenance choice.
+- Are other parsers in `Marten.Linq.Parsing.Methods` routing through `ParseWhereForContains` (or analogous fall-throughs in `ValueCollectionMember`) for non-`Contains` calls? If the fall-through is broader than this single method, Option 3 earns its keep across more call sites.
+- Test coverage over the closure-emission matrix (literal init / method-typed init / `<Nullable>` on / off) alongside whichever fix lands would catch the next compiler-shape regression at CI rather than user-side.
 
 ## Workaround in our codebase
 
